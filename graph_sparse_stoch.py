@@ -81,28 +81,24 @@ def spectral_greedy_top_n_largest(W_base, W_target, config: SpectralConfig):
         sample_size = max(1, int(len(all_candidates) * config.sample_ratio))
         sampled_candidates = random.sample(list(all_candidates), sample_size)
         
-        collect_gain = []
         # 5. 评估采样边
+        #mask = ~np.eye(config.top_n, dtype=bool)
+        #denom_matrix = evals[:, None] - evals[None, :]
+        collect_gain = []
         for (u, v) in sampled_candidates:
             w_target = W_target[u, v]
             
             # 使用 SPD 微扰公式预估所有特征值的变化
-            predicted_evals = evals.copy()
-            for i in range(config.top_n):
-                # 1. 计算一阶微扰贡献
-                delta_1st = 2 * w_target * evecs[u, i] * evecs[v, i]
+            # 1. 计算一阶微扰贡献
+            delta_1st = 2 * w_target * evecs[u, :] * evecs[v, :]
                 
-                # 2. 计算二阶微扰贡献 (遍历其余所有被截断的特征值 j)
-                delta_2nd = 0.0
-                for j in range(config.top_n):
-                    if j == i:
-                        continue
-                    denom = evals[i] - evals[j]
-                    numerator = (evecs[u, j] * evecs[v, i] + evecs[u, i] * evecs[v, j]) ** 2
-                    delta_2nd += numerator / (denom + 1e-15)
-                    
-                # 最终预测值 = 当前值 + 一阶修正 + 二阶修正
-                predicted_evals[i] += delta_1st + (w_target ** 2) * delta_2nd
+            # 2. 计算二阶微扰贡献 (遍历其余所有被截断的特征值 j)
+            #numerator_matrix = (evecs[u, None, :] * evecs[v, :, None] + evecs[v, None, :] * evecs[u, :, None]) ** 2
+            #term_matrix = (numerator_matrix / denom_matrix + 1e-15) * mask
+            #delta_2nd = (w_target ** 2) * np.sum(term_matrix, axis=1)
+                
+            # 最终预测值 = 当前值 + 一阶修正 + 二阶修正( 可能恶化结果)
+            predicted_evals = evals + delta_1st # + delta_2nd
             
             # 预测的 Loss 同样切片最后 n 个最大特征值
             predicted_loss = np.sum((predicted_evals - target_evals_top_n)**2)
