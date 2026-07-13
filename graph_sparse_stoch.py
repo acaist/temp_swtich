@@ -88,10 +88,6 @@ def spectral_greedy_top_n_largest(W_base, W_target, config: SpectralConfig):
             
             # 使用 SPD 微扰公式预估所有特征值的变化
             predicted_evals = evals.copy()
-                        for i in range(sconfig.top_n):
-                delta = 2 * w_target * evecs[u, i] * evecs[v, i]
-                predicted_evals[i] += delta
-            
             for i in range(config.top_n):
                 # 1. 计算一阶微扰贡献
                 delta_1st = 2 * w_target * evecs[u, i] * evecs[v, i]
