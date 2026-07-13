@@ -82,29 +82,28 @@ def spectral_greedy_top_n_largest(W_base, W_target, config: SpectralConfig):
         sampled_candidates = random.sample(list(all_candidates), sample_size)
         
         # 5. 评估采样边
-        #mask = ~np.eye(config.top_n, dtype=bool)
-        #denom_matrix = evals[:, None] - evals[None, :]
-        collect_gain = []
-        for (u, v) in sampled_candidates:
-            w_target = W_target[u, v]
-            
-            # 使用 SPD 微扰公式预估所有特征值的变化
-            # 1. 计算一阶微扰贡献
-            delta_1st = 2 * w_target * evecs[u, :] * evecs[v, :]
-                
-            # 2. 计算二阶微扰贡献 (遍历其余所有被截断的特征值 j)
-            #numerator_matrix = (evecs[u, None, :] * evecs[v, :, None] + evecs[v, None, :] * evecs[u, :, None]) ** 2
-            #term_matrix = (numerator_matrix / denom_matrix + 1e-15) * mask
-            #delta_2nd = (w_target ** 2) * np.sum(term_matrix, axis=1)
-                
-            # 最终预测值 = 当前值 + 一阶修正 + 二阶修正( 可能恶化结果)
-            predicted_evals = evals + delta_1st # + delta_2nd
-            
-            # 预测的 Loss 同样切片最后 n 个最大特征值
-            predicted_loss = np.sum((predicted_evals - target_evals_top_n)**2)
-            
-            gain = current_loss - predicted_loss
-            collect_gain.append((gain, (u, v)))
+        U_idx = np.array([u for u, v in sampled_candidates], dtype=np.int32)
+        V_idx = np.array([v for u, v in sampled_candidates], dtype=np.int32)
+        
+        # . 批量获取这 100 万条边在原图中的连续目标权重 (Shape: (sample_size,))
+        W_targets = W_target[U_idx, V_idx]
+        
+        # . 终极矩阵广播：一瞬间算出所有抽样边对所有 top_n 特征值的一阶贡献
+        # evecs[U_idx, :] 的 Shape 是 (sample_size, top_n)
+        delta_1st_all = 2 * W_targets[:, None] * evecs[U_idx, :] * evecs[V_idx, :]
+        
+        # . 批量计算预测特征值 (Shape: (sample_size, top_n))
+        # evals[None, :] 会自动沿行方向广播复制
+        predicted_evals_all = evals[None, :] + delta_1st_all
+        
+        # . 批量计算所有边对应的预测 Loss (Shape: (sample_size,))
+        # 沿着 axis=1 (top_n 轴) 求和，直接吐出 100 万个 Loss 值
+        predicted_losses = np.sum((predicted_evals_all - target_evals_top_n[None, :]) ** 2, axis=1)
+
+        gains = current_loss - predicted_losses
+        
+        # 利用 zip 快速组装
+        collect_gain = list(zip(gains, sampled_candidates))
         
         # 6. 批量恢复 Top-N 收益边 (使用来自 config 的 add_ratio)
         if collect_gain:
