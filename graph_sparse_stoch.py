@@ -198,6 +198,117 @@ class SpectralSparsification:
             print(f"   [Batch] 成功恢复边数: {count_add}, 剩余候选池: {len(all_candidates)}")
             return current_W, False
 
+  def compute_effective_resistances(self):
+        """
+        在算法最开始，对原稠密目标图计算全量有效电阻和抽样概率。
+        该函数仅需执行一次。
+        """
+        dim = self.W_target.shape[0]
+        # 1. 构建原稠密图的拉普拉斯矩阵
+        D = np.diag(np.sum(self.W_target, axis=1))
+        L = D - self.W_target
+        
+        # 2. 计算伪逆 (Pinverse)
+        L_pinv = la.pinv(L)
+        
+        # 3. 提取上三角候选边并计算 Re
+        tri_idx = np.triu_indices(dim, k=1)
+        u_idx, v_idx = tri_idx[0], tri_idx[1]
+        
+        weights = self.W_target[u_idx, v_idx]
+        # 只有在原图里有权重的边才计算
+        valid_mask = weights > 1e-12
+        u_idx, v_idx, weights = u_idx[valid_mask], v_idx[valid_mask], weights[valid_mask]
+        
+        # Re 计算公式
+        Re = L_pinv[u_idx, u_idx] + L_pinv[v_idx, v_idx] - 2.0 * L_pinv[u_idx, v_idx] # type: ignore
+        
+        # 4. 计算 Spielman-Teng 谱重要性得分 (Score = w * Re)
+        scores = weights * Re
+        # 归一化为概率分布
+        self.edge_probs = scores / np.sum(scores)
+        # 将候选边打包保存
+        self.static_candidates = list(zip(u_idx, v_idx))
+        self.static_weights = weights
+
+    def spectral_optimize_by_re(self) -> sp.csc_matrix:
+        """
+        全新的有效电阻抽样迭代优化器：
+        通过基于 Re 的采样探索拓扑，通过真实的谱 Cost 进行闭环拦截与损失评估。
+        """
+        dim = self.W_backbone.shape[0]
+        current_W = self.W_backbone.copy()
+        
+        # 提前提取目标 Top-N 谱
+        target_evals_all, _ = la.eigh(self.W_target)
+        self.target_evals_top_n = target_evals_all[-self.config.top_n:]
+        
+        warm_start_v0 = np.ones(dim)
+        
+        # 计算初始骨架的真实 Loss
+        evals, evecs = sp.linalg.eigsh(current_W, k=self.config.top_n, which='LA', v0=warm_start_v0)
+        best_loss = np.sum((evals - self.target_evals_top_n) ** 2)
+        best_W = current_W.copy()
+        
+        # 动态维护一个“尚未被选入骨架”的静态索引掩码
+        active_candidate_mask = np.ones(len(self.static_candidates), dtype=bool)
+        
+        for iteration in range(self.config.max_iters):
+            curr_ratio = current_W.nnz / (dim * dim)
+            if curr_ratio >= self.config.target_density_ratio or not np.any(active_candidate_mask):
+                break
+                
+            # 1. 抽取当前可用的候选边及对应的 Re 概率
+            available_indices = np.where(active_candidate_mask)[0]
+            current_probs = self.edge_probs[available_indices]
+            current_probs /= np.sum(current_probs)  # 重新归一化分布
+            
+            # 2. 按照 Re 概率进行批次抽样 (无脑乐观加边数量)
+            batch_size = max(1, int(len(available_indices) * self.config.add_ratio))
+            sampled_meta_indices = np.random.choice(
+                available_indices, size=batch_size, replace=False, p=current_probs
+            )
+            
+            # 3. 试探性构建增量矩阵 Delta W
+            U_list, V_list, DATA_list = [], [], []
+            for idx in sampled_meta_indices:
+                u, v = self.static_candidates[idx]
+                w = self.static_weights[idx]
+                U_list.extend([u, v])
+                V_list.extend([v, u])
+                DATA_list.extend([w, w])
+                
+            W_delta = sp.csc_matrix((DATA_list, (U_list, V_list)), shape=(dim, dim))
+            W_try = current_W + W_delta
+            W_try.eliminate_zeros()
+            
+            # 4. 通过真实计算特征值，评估这个批次的真实 Loss 贡献
+            try:
+                evals_try, evecs_try = sp.linalg.eigsh(
+                    W_try, k=self.config.top_n, which='LA', v0=warm_start_v0, maxiter=1000
+                )
+                loss_try = np.sum((evals_try - self.target_evals_top_n) ** 2)
+                np.copyto(warm_start_v0, evecs_try[:, -1])  # 更新热启动向量
+            except sp.linalg.ArpackNoConvergence:
+                # 谱求解若不收敛，直接视作恶性注入，跳过
+                continue
+            
+            # 5. 反馈判定：利用谱 Cost 目标做出接受或回退的抉择
+            if loss_try < best_loss:
+                # 【接受该批次】：因为真实谱误差下降了！
+                current_W = W_try
+                best_loss = loss_try
+                best_W = current_W.copy()
+                # 从候选池中永久剔除这些已经生效的边
+                active_candidate_mask[sampled_meta_indices] = False
+                print(f"迭代 {iteration}: [接受] 成功注入 {batch_size} 条高Re边, 真实误差降至: {best_loss:.4g}")
+            else:
+                # 【拒绝并回退】：此批次边对特定 Top-N 产生了谱污染，触发 Rollback
+                # current_W 保持原样不加上去，但我们可以选择不剔除这些边，或者把它们暂时锁定
+                print(f"迭代 {iteration}: [拒绝] 该批次引发谱漂移 (Loss: {loss_try:.4g} >= 最佳: {best_loss:.4g}), 触发自动回退。")
+
+        return best_W
+
 
 def test_specsparsify():
     # 加载矩阵图
