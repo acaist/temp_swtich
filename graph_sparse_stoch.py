@@ -169,34 +169,40 @@ class SpectralSparsification:
     def _add_edges(self, current_W:sp.csc_matrix, collect_gain:list, all_candidates:set):
         dim = self.W_backbone.shape[0] # type: ignore
         curr_total = current_W.nnz
+        flag = False
         
-        if len(collect_gain) > 0:
-            sorted_gain = sorted(collect_gain, key=lambda x: x[0], reverse=True)
-            add_size = max(1, int(self.config.add_ratio * len(collect_gain)))
-            count_add = 0
-            U_list, V_list, DATA_list = [], [], []
-            for gain_val, (u, v) in sorted_gain[:add_size]:
-                if gain_val < 0:
-                    continue
-                U_list.extend([u, v])
-                V_list.extend([v, u])
-                DATA_list.extend([self.W_target[u, v], self.W_target[u, v]])
-                all_candidates.remove((u, v))
-                count_add += 2 # 对称
-                
-                add_ratio = (curr_total + count_add)/(dim*dim)
-                if add_ratio > self.config.target_density_ratio:
-                    print(f"   Current added edges number reach setting ratio, {add_ratio:.3f}")
-                    delta_W_sparse = sp.coo_matrix((DATA_list, (U_list, V_list)), shape=(dim, dim)).tocsc()
-                    current_W = (current_W + delta_W_sparse).tocsc()
-                    return current_W, True
+        if len(gains) > 0:
+            sorted_idx = np.sort(-gains)
+            add_size = max(1, int(self.config.add_ratio * len(gains)))
+            add_ratio = (curr_total + add_size)/(dim*dim)
+            if add_ratio > self.config.target_density_ratio:
+                print(f"   Current added edges number reach setting ratio,"
+                      f" {self.config.target_density_ratio:.3f}")
+                add_size = int(self.config.target_density_ratio*dim*dim) - curr_total
+                flag = True
             
+            sorted_indices = np.argsort(-gains)
+            top_indices = sorted_indices[:add_size]
+
+            top_U = UVidx[0][top_indices]
+            top_V = UVidx[1][top_indices]
+            top_w = self.W_target[top_U, top_V]
+
+            pure_upper_edges = [
+                (int(u), int(v)) if u < v else (int(v), int(u)) 
+                for u, v in zip(top_U, top_V)
+            ]
+            all_candidates.difference_update(pure_upper_edges)
+            
+            rows = np.concatenate([top_U, top_V])
+            cols = np.concatenate([top_V, top_U])
+            data = np.concatenate([top_w, top_w])
             # 利用 COO 格式将这一批新边打包成一个独立的稀疏增量矩阵
-            delta_W_sparse = sp.coo_matrix((DATA_list, (U_list, V_list)), shape=(dim, dim)).tocsc()
+            delta_W_sparse = sp.coo_matrix((data, (rows, cols)), shape=(dim, dim)).tocsc()
             # 两个稀疏矩阵直接做加法，在内存连续块中一瞬间完成拓扑合流！
             current_W = current_W + delta_W_sparse
-            print(f"   [Batch] 成功恢复边数: {count_add}, 剩余候选池: {len(all_candidates)}")
-            return current_W, False
+            print(f"   [Batch] 成功恢复边数: {add_size}")
+        return current_W, flag
 
   def compute_effective_resistances(self):
         """
