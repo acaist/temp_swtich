@@ -204,6 +204,28 @@ class SpectralSparsification:
             print(f"   [Batch] 成功恢复边数: {add_size}")
         return current_W, flag
 
+   def _refine_weights_by_scale(self, current_W: sp.csc_matrix):
+        """
+        非對角線集體幅值修正
+        保持對角線剛性絕對不動，只對已選中的非對角線邊權進行集體微調，瞬間鎖定最大特徵值精度
+        """
+        evals, _ = sp.linalg.eigsh(current_W, k=self.config.top_n, which='LA')
+        
+        # 2. alpha
+        alpha = np.sum(self.target_evals_top_n * evals) / np.sum(evals ** 2)
+        # 安全約束：只允許在 0.8 到 1.2 之間微調
+        alpha = np.clip(alpha, 0.8, 1.2)
+        print(" 最终修复 rescaling non-diagnoal alpha ", alpha)
+        
+        # 3. 分层提取：提取非對角線並乘以 alpha
+        refined_W = current_W.copy()
+        orig_diag = current_W.diagonal()
+        refined_W = refined_W * alpha
+        
+        refined_W.setdiag(orig_diag)
+        refined_W.eliminate_zeros()
+        return refined_W
+
   def compute_effective_resistances(self):
         """
         在算法最开始，对原稠密目标图计算全量有效电阻和抽样概率。
