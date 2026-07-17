@@ -1,9 +1,8 @@
+import random
+from dataclasses import dataclass
 import numpy as np
 import scipy.linalg as la
 from scipy import sparse as sp
-from scipy.sparse import csgraph
-import random
-from dataclasses import dataclass
 
 @dataclass
 class SpectralConfig:
@@ -99,8 +98,9 @@ class SpectralSparsification:
         self.target_evals_top_n = target_evals_all[-self.config.top_n:] # 升序矩阵中，最后 n 个是最大的
 
         # 特征值的初始搜索向量
+        orginal_ratio = self.config.add_ratio
         warm_start_v0 = np.ones(dim)
-        
+        best_loss = np.inf
         for iteration in range(self.config.max_iters):
             curr_total = current_W.nnz
             curr_ratio = curr_total / (dim * dim)
@@ -115,22 +115,129 @@ class SpectralSparsification:
             sample_size = max(1, int(len(all_candidates) * self.config.sample_ratio))
             sampled_candidates = random.sample(list(all_candidates), sample_size)
             
-            # 矩阵一阶微扰动快速评估收益
+            # 矩阵一阶微扰动快速评估谱收益
             # 评估采样边
             U_idx = np.array([u for u, v in sampled_candidates], dtype=np.int32)
             V_idx = np.array([v for u, v in sampled_candidates], dtype=np.int32)
-            gains = collect_gain = self._calculate_gains(current_W, (U_idx, V_idx), warm_start_v0, add_sign=1.0)
-            # 利用 zip 快速组装，只有在最终排序时才接触 Python 对象，速度提升数万倍
-            collect_gain = list(zip(gains, sampled_candidates))
-          
-            # 批量恢复 Top-N 收益边 (使用来自 config 的 add_ratio)
-            current_W, isfinished = self._add_edges(current_W, collect_gain, all_candidates)
-            if isfinished:
-                return current_W
+            gains_spectral = self._calculate_spectral_gains(current_W, (U_idx, V_idx), warm_start_v0, add_sign=1.0)
+            
+            # 评估 fill—in 收益
+            node_degree, node_common = self._calcualte_edge_degree(current_W, U_idx, V_idx)
 
+            # 计算得分，鼓励谱收益和聚团，惩罚度连接
+            scores = gains_spectral *(1+ node_common) #/(node_degree + 1)
+            
+            print(" scores > 0 counts: ", np.sum(scores >0))
+
+            # 批量恢复 Top-N 收益边 (使用来自 config 的 add_ratio)
+            if len(scores) > 0:
+                current_W, isfinished = self._add_edges(current_W, scores, (U_idx, V_idx), all_candidates)
+                if isfinished:
+                    current_W = self._refine_weights_by_scale(current_W)
+                    return current_W
+        
+        current_W = self._refine_weights_by_scale(current_W)
         return current_W
     
-    def _calculate_gains(self, current_W:sp.csc_matrix, UV_idx:tuple, warm_start_v0:np.ndarray, add_sign=1.0):
+    def _refine_weights_by_scale(self, current_W: sp.csc_matrix):
+        """
+        非對角線集體幅值修正 0秒流
+        保持對角線剛性絕對不動，只對已選中的非對角線邊權進行集體微調，瞬間鎖定最大特徵值精度
+        """
+        #
+        evals, _ = sp.linalg.eigsh(current_W, k=self.config.top_n, which='LA')
+        
+        # 2. alpha
+        alpha = np.sum(self.target_evals_top_n * evals) / np.sum(evals ** 2)
+        ratios = (evals + 1e-30) / (self.target_evals_top_n + 1e-30)
+        alpha = np.sum(ratios) / np.sum(ratios ** 2)
+        # 安全約束：只允許在 0.8 到 1.2 之間微調
+        alpha = np.clip(alpha, 0.8, 1.2)
+        print(" 最终修复 rescaling non-diagnoal alpha ", alpha)
+        
+        # 3. 分层提取：提取非對角線並乘以 alpha
+        refined_W = current_W.copy()
+        orig_diag = current_W.diagonal()
+        refined_W = refined_W * alpha
+        
+        refined_W.setdiag(orig_diag)
+        refined_W.eliminate_zeros()
+        return refined_W
+    
+    def _calcualte_edge_degree(self, spmat:sp.csc_matrix, us:np.ndarray, vs:np.ndarray):
+        """
+        计算节点度, 评估fill-in
+        """
+        # 1. Degrees are simply the sum of rows in the adjacency matrix
+        # (or the number of non-zero elements per row)
+        degrees = np.diff(spmat.indptr)
+        deg_u = degrees[us]
+        deg_v = degrees[vs]
+        deg_product = deg_u * deg_v
+        
+        # 2. Common neighbors using CSR row slicing
+        # 2. Compute Common Neighbors in Batch
+        num_edges= len(us)
+        common_counts = np.zeros(num_edges, dtype=np.int32)
+        
+        # Extract the internal structures of the CSC matrix for maximum speed
+        indptr = spmat.indptr
+        indices = spmat.indices
+
+        for i in range(num_edges):
+            ui = us[i]
+            vi = vs[i]
+            
+            # Slicing the raw row-index arrays directly avoids object creation overhead
+            neighbors_u = indices[indptr[ui]:indptr[ui+1]]
+            neighbors_v = indices[indptr[vi]:indptr[vi+1]]
+            
+            # CSC column indices are natively sorted, allowing intersect1d to run in O(N+M) time
+            common_counts[i] = len(np.intersect1d(neighbors_u, neighbors_v, assume_unique=True))
+        
+        return deg_product, common_counts
+    
+    def _calculate_exact_spectral(self, current_W: sp.csc_matrix, sampled_candidates: list):
+        """
+        Exact Lambda Evaluation:
+        Instead of trusting 1st-order math, this inserts an entire candidate batch,
+        checks the absolute true eigenvalue loss, and decides whether to accept the batch.
+        """
+        if len(sampled_candidates) == 0:
+            return current_W, False
+
+        # 1. Temporarily assemble ALL sampled edges into a delta matrix
+        dim = self.W_target.shape[0]
+        U_list, V_list, DATA_list = [], [], []
+        for u, v in sampled_candidates:
+            # Must use the exact continuous true weight from target matrix
+            true_w = self.W_target[u, v]
+            U_list.extend([u, v])
+            V_list.extend([v, u])
+            DATA_list.extend([true_w, true_w])
+            
+        W_delta = sp.csc_matrix((DATA_list, (U_list, V_list)), shape=(dim, dim))
+        
+        # 2. Speculatively add them to the matrix
+        W_try = current_W + W_delta
+        W_try.eliminate_zeros()
+        
+        # 3. Calculate the ABSOLUTE EXACT eigenvalues of this speculative matrix
+        try:
+            evals_try, evecs_try = sp.linalg.eigsh(
+                W_try, 
+                k=self.config.top_n, 
+                which='LA', 
+                ncv=self.config.top_n * 2,
+                maxiter=1000
+            )
+            # True exact loss
+            return evals_try
+        except sp.linalg.ArpackNoConvergence:
+            # If numerical solvers fail to converge, reject this batch safely
+            return None
+
+    def _calculate_spectral_gains(self, current_W:sp.csc_matrix, UV_idx:tuple, warm_start_v0:np.ndarray, add_sign=1.0):
         # 计算当前矩阵的谱, 洛伦兹迭代很快
         evals, evecs = sp.linalg.eigsh (
             current_W, 
@@ -151,29 +258,30 @@ class SpectralSparsification:
         
         # 3. 终极矩阵广播：一瞬间算出所有抽样边对所有 top_n 特征值的一阶贡献
         # evecs[U_idx, :] 的 Shape 是 (sample_size, top_n)
-        delta_1st_all = add_sign * 2 * W_targets[:, None] * evecs[U_idx, :] * evecs[V_idx, :]
+        X_u = evecs[U_idx, :]
+        X_v = evecs[V_idx, :]
+        #delta_1st_all = add_sign * 2 * W_targets[:, None] * X_u * X_v
+        delta_1st_all = add_sign * 2.0 * W_targets[:, None] * (X_u**2 + X_v**2 - X_u * X_v)
         
         # 4. 批量计算预测特征值 (Shape: (sample_size, top_n))
-        # evals[None, :] 会自动沿行方向广播复制
         predicted_evals_all = evals[None, :] + delta_1st_all
         
         # 5. 批量计算所有边对应的预测 Loss (Shape: (sample_size,))
-        # 沿着 axis=1 (top_n 轴) 求和，直接吐出 100 万个 Loss 值
         predicted_losses = np.sum((predicted_evals_all - self.target_evals_top_n[None, :]) ** 2, axis=1)
         
         # 6. 计算收益（Gain）并与边坐标直接绑定排序
         gains = current_loss - predicted_losses
-                
+        
         return gains
     
-    def _add_edges(self, current_W:sp.csc_matrix, collect_gain:list, all_candidates:set):
+    def _add_edges(self, current_W:sp.csc_matrix, scores:np.ndarray, UVidx:tuple, all_candidates:set):
         dim = self.W_backbone.shape[0] # type: ignore
         curr_total = current_W.nnz
         flag = False
         
-        if len(gains) > 0:
-            sorted_idx = np.sort(-gains)
-            add_size = max(1, int(self.config.add_ratio * len(gains)))
+        if len(scores) > 0:
+            sorted_idx = np.sort(-scores) # 降序排列，取出前n大
+            add_size = max(1, int(self.config.add_ratio * len(scores)))
             add_ratio = (curr_total + add_size)/(dim*dim)
             if add_ratio > self.config.target_density_ratio:
                 print(f"   Current added edges number reach setting ratio,"
@@ -181,7 +289,7 @@ class SpectralSparsification:
                 add_size = int(self.config.target_density_ratio*dim*dim) - curr_total
                 flag = True
             
-            sorted_indices = np.argsort(-gains)
+            sorted_indices = np.argsort(-scores)
             top_indices = sorted_indices[:add_size]
 
             top_U = UVidx[0][top_indices]
@@ -203,30 +311,40 @@ class SpectralSparsification:
             current_W = current_W + delta_W_sparse
             print(f"   [Batch] 成功恢复边数: {add_size}")
         return current_W, flag
+        
+        
+    def _drop_edges(self, current_W:sp.csc_matrix, collect_gain:list):
+        dim = self.W_backbone.shape[0] # type: ignore
+        curr_total = current_W.nnz
+        
+        if len(collect_gain) > 0:
+            sorted_gain = sorted(collect_gain, key=lambda x: x[0], reverse=True)
+            add_size = max(1, int(self.config.add_ratio * len(collect_gain)))
+            count_add = 0
+            U_list, V_list, DATA_list = [], [], []
+            for gain_val, (u, v) in sorted_gain[:add_size]:
+                U_list.extend([u, v])
+                V_list.extend([v, u])
+                DATA_list.extend([self.W_target[u, v], self.W_target[u, v]])
+                count_add += 2 # 对称
+                
+                drop_ratio = (curr_total + count_add)/(dim*dim)
+                if drop_ratio < self.config.target_density_ratio:
+                    print(f"   Current drop edges number reach setting ratio, {drop_ratio:.3f}")
+                    delta_W_sparse = sp.coo_matrix((DATA_list, (U_list, V_list)), shape=(dim, dim)).tocsc()
+                    current_W = (current_W - delta_W_sparse).tocsc()
+                    current_W.eliminate_zeros()
+                    return current_W, True
+            
+            # 利用 COO 格式将这一批新边打包成一个独立的稀疏增量矩阵
+            delta_W_sparse = sp.coo_matrix((DATA_list, (U_list, V_list)), shape=(dim, dim)).tocsc()
+            # 两个稀疏矩阵直接做加法，在内存连续块中一瞬间完成拓扑合流！
+            current_W = current_W - delta_W_sparse
+            current_W.eliminate_zeros()
+            print(f"   [Batch] 成功移除边数: {count_add}")
+            return current_W, False
 
-   def _refine_weights_by_scale(self, current_W: sp.csc_matrix):
-        """
-        非對角線集體幅值修正
-        保持對角線剛性絕對不動，只對已選中的非對角線邊權進行集體微調，瞬間鎖定最大特徵值精度
-        """
-        evals, _ = sp.linalg.eigsh(current_W, k=self.config.top_n, which='LA')
-        
-        # 2. alpha
-        alpha = np.sum(self.target_evals_top_n * evals) / np.sum(evals ** 2)
-        # 安全約束：只允許在 0.8 到 1.2 之間微調
-        alpha = np.clip(alpha, 0.8, 1.2)
-        print(" 最终修复 rescaling non-diagnoal alpha ", alpha)
-        
-        # 3. 分层提取：提取非對角線並乘以 alpha
-        refined_W = current_W.copy()
-        orig_diag = current_W.diagonal()
-        refined_W = refined_W * alpha
-        
-        refined_W.setdiag(orig_diag)
-        refined_W.eliminate_zeros()
-        return refined_W
-
-  def compute_effective_resistances(self):
+    def compute_effective_resistances(self):
         """
         在算法最开始，对原稠密目标图计算全量有效电阻和抽样概率。
         该函数仅需执行一次。
@@ -338,6 +456,23 @@ class SpectralSparsification:
         return best_W
 
 
+def evaluate_fill_in_via_ldl(mat: sp.csc_matrix):
+    """
+    使用 LDLt 分解结构评估两个 CSC 稀疏矩阵的全量 Fill-in 差异。
+    注意：输入应当是结构对称的（结构非零元对称）。
+    """
+    # 对矩阵进行 LDL 分解并统计
+    try:
+        lu = sp.linalg.splu(mat.tocsc(), permc_spec='MMD_AT_PLUS_A', diag_pivot_thresh=0.0)
+        # L 和 U 的总非零元就是该图拓扑带来的全量 Fill-in 表现
+        nnz_factors = lu.L.nnz + lu.U.nnz
+        fills = nnz_factors - mat.nnz
+    except RuntimeError as e:
+        print(f"矩阵 LDL 分解失败（可能是奇异矩阵或未做预排序）: {e}")
+        return None
+        
+    return fills
+
 def test_specsparsify():
     # 加载矩阵图
     print(" load numpy matrix ")
@@ -354,7 +489,7 @@ def test_specsparsify():
         max_iters=500,
         sample_ratio=0.3,
         add_ratio=0.1,
-        target_density_ratio=0.7
+        target_density_ratio=0.75
     )
     
     # 实例化谱稀疏化对象
@@ -365,22 +500,31 @@ def test_specsparsify():
     # 运行算法
     sparsifier.generate_backbone()
     final_W = sparsifier.spectral_optimize()
+    # sparsifier.compute_effective_resistances()
+    # final_W = sparsifier.spectral_optimize_by_re()
     
     # 精确验证谱恢复结果
-    target_evals, _ = la.eigh(W_target)
-    final_evals, _ = la.eigh(final_W.toarray())
+    target_evals, target_evecs = la.eigh(W_target)
+    final_evals, final_evecs = la.eigh(final_W.toarray())
+    
+    #
     
     print(f"\n[针对前 {sconfig.top_n} 个最大特征值的优化报告]")
+    print(f"\n density ratio ", final_W.nnz / (dim*dim))
     evals_diff_abs = final_evals[-sconfig.top_n:] - target_evals[-sconfig.top_n:]
     evals_diff_rel = evals_diff_abs / (np.abs(target_evals[-sconfig.top_n:]) + 1e-15)
     final_top_n_mse = np.sum((evals_diff_abs)**2)
+    cos_matrix = target_evecs.T @ final_evecs
+    loss_evecs = cos_matrix.shape[0] - np.sum(cos_matrix ** 2)
     print(" 原始矩阵前n个最大特征值\n", target_evals[-sconfig.top_n:])
     print(" 谱近似矩阵前n个最大特征值\n", final_evals[-sconfig.top_n:])
     print(f"Top-{sconfig.top_n} 总和绝对误差 (MSE): {final_top_n_mse:.4e}\n"
           f"Top-{sconfig.top_n} 平均绝对误差(MSE): {final_top_n_mse/sconfig.top_n:.2e}\n"
           f"Top-{sconfig.top_n} 相对误差:\n {evals_diff_rel}\n"
-          f"Top-{sconfig.top_n} 平均相对误差: {np.mean(np.abs(evals_diff_rel)):.4e}")
+          f"Top-{sconfig.top_n} 平均相对误差: {np.mean(np.abs(evals_diff_rel)):.4e}\n"
+          f" 特征向量几何误差: {loss_evecs:.4e}")
 
+    print(f" 稀疏矩阵fill-in评估 {evaluate_fill_in_via_ldl(final_W)}")
 
 # ==================== 测试验证 ====================
 if __name__ == "__main__":
