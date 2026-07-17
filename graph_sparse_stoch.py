@@ -176,11 +176,49 @@ class SpectralSparsification:
         deg_product = deg_u * deg_v
         
         # 2. Common neighbors using CSR row slicing
-        A_unweighted = spmat.copy()
-        A_unweighted.data = np.ones_like(A_unweighted.data)
-        A_sub = A_unweighted[:, us]
-        Common_matrix = A_unweighted.T.dot(A_sub)
-        common_counts = np.array(Common_matrix[vs, np.arange(len(us))]).flatten()
+        indptr = spmat.indptr
+        indices = spmat.indices
+        N = dim
+        num_edges = len(us)
+        common_counts = np.zeros(num_edges, dtype=np.int32)
+        chunk_size = 500000 
+        for start_idx in range(0, num_edges, chunk_size):
+            end_idx = min(start_idx + chunk_size, num_edges)
+            c_us = us[start_idx:end_idx]
+            c_vs = vs[start_idx:end_idx]
+            num_chunk = len(c_us)
+            s_u, e_u = indptr[c_us], indptr[c_us + 1]
+            s_v, e_v = indptr[c_vs], indptr[c_vs + 1]
+            len_u = e_u - s_u
+            len_v = e_v - s_v
+            
+            # 向量化平摊克隆
+            edge_ids_u = np.repeat(np.arange(num_chunk, dtype=np.int32), len_u)
+            edge_ids_v = np.repeat(np.arange(num_chunk, dtype=np.int32), len_v)
+            
+            # 闪电拉出一维邻居大数组（由于直接操作内存物理视图，速度极快）
+            cum_lens_u = np.cumsum(len_u)
+            offsets_u = np.arange(cum_lens_u[-1], dtype=np.int32) - np.repeat(cum_lens_u - len_u, len_u)
+            indices_ptrs_u = np.repeat(s_u, len_u) + offsets_u
+            all_neighbors_u = indices[indices_ptrs_u]
+            #
+            cum_lens_v = np.cumsum(len_v)
+            offsets_v = np.arange(cum_lens_v[-1], dtype=np.int32) - np.repeat(cum_lens_v - len_v, len_v)
+            indices_ptrs_v = np.repeat(s_v, len_v) + offsets_v
+            all_neighbors_v = indices[indices_ptrs_v]
+            #
+            combined_edge_ids = np.concatenate([edge_ids_u, edge_ids_v])
+            combined_neighbors = np.concatenate([all_neighbors_u, all_neighbors_v])
+            shift_bits = int(np.ceil(np.log2(dim)))
+            combined_ids = (combined_edge_ids << shift_bits) | combined_neighbors
+            combined_ids.sort(kind='mergesort')
+            matches = combined_ids[:-1] == combined_ids[1:]
+
+            if np.any(matches):
+                #matched_edge_ids = combined_ids[1:][matches] // N
+                matched_edge_ids = combined_ids[1:][matches] >> shift_bits
+                counts = np.bincount(matched_edge_ids, minlength=num_chunk)
+                common_counts[start_idx:end_idx] = counts
         
         return deg_product, common_counts
     
