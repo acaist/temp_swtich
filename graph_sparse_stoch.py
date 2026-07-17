@@ -176,24 +176,11 @@ class SpectralSparsification:
         deg_product = deg_u * deg_v
         
         # 2. Common neighbors using CSR row slicing
-        # 2. Compute Common Neighbors in Batch
-        num_edges= len(us)
-        common_counts = np.zeros(num_edges, dtype=np.int32)
-        
-        # Extract the internal structures of the CSC matrix for maximum speed
-        indptr = spmat.indptr
-        indices = spmat.indices
-
-        for i in range(num_edges):
-            ui = us[i]
-            vi = vs[i]
-            
-            # Slicing the raw row-index arrays directly avoids object creation overhead
-            neighbors_u = indices[indptr[ui]:indptr[ui+1]]
-            neighbors_v = indices[indptr[vi]:indptr[vi+1]]
-            
-            # CSC column indices are natively sorted, allowing intersect1d to run in O(N+M) time
-            common_counts[i] = len(np.intersect1d(neighbors_u, neighbors_v, assume_unique=True))
+        A_unweighted = spmat.copy()
+        A_unweighted.data = np.ones_like(A_unweighted.data)
+        A_sub = A_unweighted[:, us]
+        Common_matrix = A_unweighted.T.dot(A_sub)
+        common_counts = np.array(Common_matrix[vs, np.arange(len(us))]).flatten()
         
         return deg_product, common_counts
     
