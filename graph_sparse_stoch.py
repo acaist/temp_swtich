@@ -94,9 +94,12 @@ class SpectralSparsification:
         print(f"初始候选池 {len(all_candidates)}, Wtarget nnz/2 {np.count_nonzero(self.W_target)/2}") 
                     
         # 2. 提前计算目标谱，并提取出前 n 个最大的特征值
-        target_evals_all, target_evecs = la.eigh(self.W_target)
-        self.target_evals_top_n = target_evals_all[-self.config.top_n:] # 升序矩阵中，最后 n 个是最大的
-
+        #target_evals_all, target_evecs = la.eigh(self.W_target)
+        #self.target_evals_top_n = target_evals_all[-self.config.top_n:] # 升序矩阵中，最后 n 个是最大的
+        
+        Reff = self._compute_effective_resistances(self.W_target)
+        sort_indices = np.argsort(-Reff, axis=None)[:self.config.top_n]
+        self.target_evals_top_n = Reff.flat[sort_indices]
         # 特征值的初始搜索向量
         orginal_ratio = self.config.add_ratio
         warm_start_v0 = np.ones(dim)
@@ -119,8 +122,8 @@ class SpectralSparsification:
             # 评估采样边
             U_idx = np.array([u for u, v in sampled_candidates], dtype=np.int32)
             V_idx = np.array([v for u, v in sampled_candidates], dtype=np.int32)
-            gains_spectral = self._calculate_spectral_gains(current_W, (U_idx, V_idx), warm_start_v0, add_sign=1.0)
-            
+            #gains_spectral = self._calculate_spectral_gains(current_W, (U_idx, V_idx), warm_start_v0, add_sign=1.0)
+            gains_spectral = self._calculate_Reffective_gains(current_W, (U_idx, V_idx))
             # 评估 fill—in 收益
             node_degree, node_common = self._calcualte_edge_degree(current_W, U_idx, V_idx)
 
@@ -285,8 +288,8 @@ class SpectralSparsification:
         # evecs[U_idx, :] 的 Shape 是 (sample_size, top_n)
         X_u = evecs[U_idx, :]
         X_v = evecs[V_idx, :]
-        #delta_1st_all = add_sign * 2 * W_targets[:, None] * X_u * X_v
-        delta_1st_all = add_sign * 2.0 * W_targets[:, None] * (X_u**2 + X_v**2 - X_u * X_v)
+        delta_1st_all = add_sign * 2 * W_targets[:, None] * X_u * X_v
+        #delta_1st_all = add_sign * W_targets[:, None] * (X_u**2 + X_v**2 - X_u * X_v)
         
         # 4. 批量计算预测特征值 (Shape: (sample_size, top_n))
         predicted_evals_all = evals[None, :] + delta_1st_all
@@ -368,39 +371,88 @@ class SpectralSparsification:
             current_W.eliminate_zeros()
             print(f"   [Batch] 成功移除边数: {count_add}")
             return current_W, False
+    
+    def _calculate_Reffective_gains(self, current_W:sp.csc_matrix, UV_idx:tuple):
+        # 计算当前有效电阻Re
+        Re_curr = self._compute_effective_resistances(current_W)
+        sorted_indices = np.argsort(-Re_curr, axis=None)[: self.config.top_n]
+        Re_curr_sorted = Re_curr.flat[sorted_indices]
+        
+        # 使用来自 config 的 top_n
+        current_loss = np.sum((Re_curr_sorted - self.target_evals_top_n)**2)
+        
+        # 2. 批量获取这 100 万条边在原图中的连续目标权重 (Shape: (sample_size,))
+        U_idx, V_idx = UV_idx
+        
+        # 3. 算出对所有 top_n 特征值的一阶贡献
+        #运用 Sherman-Morrison 秩一微扰闭式解
+        # 计算公式： \Delta Reff = (w * R^2) / (1 + w * R)
+        current_reff = Re_curr[U_idx, V_idx]
+        delta_weight = self.W_target[U_idx, V_idx]
+        
+        # 该边加入后，全图在该通道上能够“挽回/增长”的谱能量差值（得分）
+        # reff_decrease = - (w * R * R) / (1.0 + w * R)
+        # reff_decrease = -(delta_weight * current_reff * current_reff) / (1.0 + delta_weight * current_reff)
+        rho = delta_weight / (1.0 + delta_weight * current_reff + 1e-20) # Shape: (sample_size,)
+        
+        top_x, top_y = np.unravel_index(sorted_indices, Re_curr.shape) # Shape: (top_n,)
+        term1 = Re_curr[top_x[None, :], V_idx[:, None]] # R(x, j)
+        term2 = Re_curr[top_y[None, :], U_idx[:, None]] # R(y, i)
+        term3 = Re_curr[top_x[None, :], U_idx[:, None]] # R(x, i)
+        term4 = Re_curr[top_y[None, :], V_idx[:, None]] # R(y, j)
+        # 拓扑传导因子 T = Z_xi - Z_xj - Z_yi + Z_yj
+        T = 0.5 * (term1 + term2 - term3 - term4) # Shape: (sample_size, top_n)
+        
+        # 算出 100 万条新边对 116 个监控端口产生的全局有效电阻下压矩阵
+        reff_decrease_all = - rho[:, None] * (T ** 2) # Shape: (sample_size, top_n)
+        
+        # 4. 批量计算预测特征值 (Shape: (sample_size, top_n))
+        predicted_evals_all = Re_curr_sorted[None, :] + reff_decrease_all
+        
+        # 5. 批量计算所有边对应的预测 Loss (Shape: (sample_size,))
+        predicted_losses = np.sum((predicted_evals_all - self.target_evals_top_n[None, :]) ** 2, axis=1)
+        
+        # 6. 计算收益（Gain）并与边坐标直接绑定排序
+        gains = current_loss - predicted_losses
+        
+        return gains
 
-    def compute_effective_resistances(self):
-        """
-        在算法最开始，对原稠密目标图计算全量有效电阻和抽样概率。
-        该函数仅需执行一次。
-        """
-        dim = self.W_target.shape[0]
+    def _compute_effective_resistances(self):
+        if isinstance(W_current, sp.csc_matrix):
+            W_current = W_current.toarray()
         # 1. 构建原稠密图的拉普拉斯矩阵
-        D = np.diag(np.sum(self.W_target, axis=1))
-        L = D - self.W_target
+        W_adj = W_current.copy()
+        np.fill_diagonal(W_adj, 0)
+        # 提取出对角线接地项（对地电导/磁阻）
+        G_ground = np.diag(W_current)
+
+        # 2. 构建完善的接地拉普拉斯矩阵
+        # D 仅由跨节点邻接矩阵的行和决定
+        D = np.diag(np.sum(W_adj, axis=1))
+        # 最终的 L 必须叠加对地项 G_ground！此时 L 变为满秩正定矩阵
+        L = D - W_adj + np.diag(G_ground)
         
         # 2. 计算伪逆 (Pinverse)
-        L_pinv = la.pinv(L)
-        
-        # 3. 提取上三角候选边并计算 Re
-        tri_idx = np.triu_indices(dim, k=1)
-        u_idx, v_idx = tri_idx[0], tri_idx[1]
-        
-        weights = self.W_target[u_idx, v_idx]
-        # 只有在原图里有权重的边才计算
-        valid_mask = weights > 1e-12
-        u_idx, v_idx, weights = u_idx[valid_mask], v_idx[valid_mask], weights[valid_mask]
+        L_pinv = la.inv(L)
         
         # Re 计算公式
-        Re = L_pinv[u_idx, u_idx] + L_pinv[v_idx, v_idx] - 2.0 * L_pinv[u_idx, v_idx] # type: ignore
+        diag_pinv = np.diag(L_pinv)
+        # 通过广播机制生成 Re_matrix[i, j] = L_pinv[i,i] + L_pinv[j,j] - 2*L_pinv[i,j]
+        Re_matrix = diag_pinv[:, None] + diag_pinv[None, :] - 2.0 * L_pinv # type:ignore
         
         # 4. 计算 Spielman-Teng 谱重要性得分 (Score = w * Re)
-        scores = weights * Re
+        # 只有在原图里有权重的边才计算
+        weights = W_current
+        # valid_mask = weights > 1e-15
+        # weights = weights[valid_mask]
+        # Re_sampled = Re_matrix[valid_mask]
+        scores = weights * Re_matrix
         # 归一化为概率分布
-        self.edge_probs = scores / np.sum(scores)
-        # 将候选边打包保存
-        self.static_candidates = list(zip(u_idx, v_idx))
-        self.static_weights = weights
+        # self.edge_probs = scores / np.sum(scores)
+        # # 将候选边打包保存
+        # self.static_candidates = list(zip(u_idx, v_idx))
+        # self.static_weights = weights
+        return scores
 
     def spectral_optimize_by_re(self) -> sp.csc_matrix:
         """
@@ -550,6 +602,20 @@ def test_specsparsify():
           f" 特征向量几何误差: {loss_evecs:.4e}")
 
     print(f" 稀疏矩阵fill-in评估 {evaluate_fill_in_via_ldl(final_W)}")
+
+    # 评估 Reff
+    Reff = sparsifier._compute_effective_resistances(W_target)
+    Reff_sp = sparsifier._compute_effective_resistances(final_W.toarray())
+    Reff_bb = sparsifier._compute_effective_resistances(backbone.toarray())
+    Reff_sorted = np.argsort(-Reff, axis=None)[:20]
+    Reff_sp_sorted = np.argsort(-Reff_sp, axis=None)[:20]
+    Reff_bb_sorted = np.argsort(-Reff_bb, axis=None)[:20]
+    print(" org shape ", Reff.shape)
+    print(" sp shape ", Reff_sp.shape)
+    print(" bb shape ", Reff_bb.shape)
+    print(" original top Reff \n", Reff.flat[Reff_sorted])
+    print(" sparse top Reff \n", Reff_sp.flat[Reff_sp_sorted])
+    print(" backbobe top Reff \n", Reff_bb.flat[Reff_bb_sorted])
 
 # ==================== 测试验证 ====================
 if __name__ == "__main__":
