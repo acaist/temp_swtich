@@ -1,7 +1,6 @@
 import os
 
-
-class Decrypter:
+class DecrypterRC4:
     def __init__(self, keystr:str) -> None:
         self.keystr:str = keystr
     
@@ -62,7 +61,7 @@ class Decrypter:
         print(f"[*] 文件输出至: {output_file}")
 
 def decrypfile(keystr:str, encrypted_target:str, decrypted_output:str="decryptedFile.txt"):
-    decrypter = Decrypter(keystr)
+    decrypter = DecrypterRC4(keystr)
     decrypter.decrypt(encrypted_target, decrypted_output)
     
 # ====================  ====================
