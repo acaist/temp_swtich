@@ -1,0 +1,207 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <title>XIM_Lmatrix 动态关联原理图(已修正)</title>
+    <style>
+        body {
+            font-family: 'Segoe UI', Arial, sans-serif;
+            margin: 0;
+            padding: 20px;
+            background-color: #f5f6fa;
+            color: #2c3e50;
+        }
+        h1 { font-size: 1.5rem; margin-bottom: 5px; }
+        .subtitle { font-size: 0.9rem; color: #7f8c8d; margin-bottom: 15px; }
+        .hint-box {
+            background-color: #e8f4fd;
+            border-left: 4px solid #3498db;
+            padding: 12px;
+            font-size: 0.85rem;
+            margin-bottom: 15px;
+            border-radius: 0 4px 4px 0;
+        }
+        .canvas-container {
+            background: #ffffff;
+            padding: 15px;
+            border-radius: 8px;
+            box-shadow: 0 4px 10px rgba(0,0,0,0.05);
+            display: inline-block;
+        }
+        /* 交互可悬停元素的样式 */
+        .interactive { cursor: pointer; pointer-events: all; }
+        .interactive:hover { filter: drop-shadow(0px 0px 5px #3498db); opacity: 0.8; }
+        
+        /* 默认隐藏所有关联线 */
+        .coupling-line { display: none; stroke-dasharray: 4,4; stroke-width: 1.5; pointer-events: none; }
+        
+        /* 显示触发 */
+        .show-link { display: block !important; }
+    </style>
+</head>
+<body>
+
+    <h1>XIM_Lmatrix 动态矩阵关联原理图</h1>
+    <div class="subtitle">前4通道与4核心节点联合排版，全原生电路矢量拓扑。</div>
+    
+    <div class="hint-box">
+        <strong>💡 联动测试方法：</strong> <br>
+        1. 将鼠标悬停在左侧紫色圆圈 <strong>V1 ~ V4（采样源）</strong> 上：展示其通过 <strong>F受控源</strong> 前向注入右侧 Node 1~4 的链接关系。<br>
+        2. 将鼠标悬停在右侧红色圆点 <strong>Node 1 ~ Node 4</strong> 上：展示其通过 <strong>G受控源</strong> 反馈给左侧各支路 N1M~N4M 的链接关系。
+    </div>
+
+    <div class="canvas-container">
+        <svg width="1050" height="480" viewBox="0 0 1050 480" xmlns="http://w3.org">
+            
+            <defs>
+                <!-- 电感组件 -->
+                <g id="ind">
+                    <path d="M 0,0 L 12,0 C 12,-8 19,-8 19,0 C 19,-8 26,-8 26,0 C 26,-8 33,-8 33,0 C 33,-8 40,-8 40,0 L 52,0" fill="none" stroke="#3498db" stroke-width="2"/>
+                </g>
+                <!-- 电阻组件 -->
+                <g id="res">
+                    <path d="M 0,0 L 12,0 L 15,-6 L 21,6 L 27,-6 L 33,6 L 39,-6 L 45,6 L 48,0 L 60,0" fill="none" stroke="#2ecc71" stroke-width="2"/>
+                </g>
+                <!-- 电压源 -->
+                <g id="vsrc">
+                    <circle cx="20" cy="0" r="12" fill="#fff" stroke="#9b59b6" stroke-width="2"/>
+                    <path d="M 0,0 L 8,0 M 32,0 L 40,0" fill="none" stroke="#9b59b6" stroke-width="2"/>
+                    <path d="M 15,0 L 19,0 M 17,-2 L 17,2 M 21,0 L 25,0" fill="none" stroke="#9b59b6" stroke-width="1.5"/>
+                </g>
+                <!-- 接地 -->
+                <g id="gnd">
+                    <path d="M 0,0 L 0,10 M -10,10 L 10,10 M -6,14 L 6,14 M -2,18 L 2,18" fill="none" stroke="#7f8c8d" stroke-width="2"/>
+                </g>
+            </defs>
+
+            <style>
+                .node-lbl { font-size: 11px; fill: #e74c3c; font-weight: bold; }
+                .comp-lbl { font-size: 12px; fill: #2c3e50; font-weight: 600; }
+                .val-lbl { font-size: 10px; fill: #95a5a6; }
+                .block-title { font-size: 14px; fill: #34495e; font-weight: bold; }
+            </style>
+
+            <text x="30" y="35" class="block-title">端口信号输入路径 (Port 1 ~ 4)</text>
+            <text x="750" y="35" class="block-title">核心状态网络 (Node 1 ~ 4)</text>
+            <line x1="30" y1="45" x2="1020" y2="45" stroke="#eee" stroke-width="2"/>
+
+            <!-- ==================== 左侧通道支路 ==================== -->
+            <!-- 通道 1 -->
+            <g transform="translate(30, 100)">
+                <text x="0" y="4" class="node-lbl">N1P</text><line x1="30" y1="0" x2="50" y2="0" stroke="#7f8c8d" stroke-width="1.5"/>
+                <use href="#ind" x="50" y="0"/><text x="58" y="-12" class="comp-lbl">LD1</text><text x="110" y="16" class="node-lbl">N1M1</text>
+                <!-- 绑定交互方法 -->
+                <use href="#vsrc" x="130" y="0" class="interactive" onmouseover="showGroup('v1')" onmouseout="clearAll()"/>
+                <text x="140" y="-15" class="comp-lbl">V1 (采样)</text><text x="178" y="16" class="node-lbl">N1M</text>
+                <use href="#res" x="200" y="0"/><text x="215" y="-12" class="comp-lbl">R1</text>
+                <line x1="260" y1="0" x2="280" y2="0" stroke="#7f8c8d" stroke-width="1.5"/><text x="288" y="4" class="node-lbl">N1N</text>
+            </g>
+
+            <!-- 通道 2 -->
+            <g transform="translate(30, 190)">
+                <text x="0" y="4" class="node-lbl">N2P</text><line x1="30" y1="0" x2="50" y2="0" stroke="#7f8c8d" stroke-width="1.5"/>
+                <use href="#ind" x="50" y="0"/><text x="58" y="-12" class="comp-lbl">LD2</text><text x="110" y="16" class="node-lbl">N2M1</text>
+                <use href="#vsrc" x="130" y="0" class="interactive" onmouseover="showGroup('v2')" onmouseout="clearAll()"/>
+                <text x="140" y="-15" class="comp-lbl">V2 (采样)</text><text x="178" y="16" class="node-lbl">N2M</text>
+                <use href="#res" x="200" y="0"/><text x="215" y="-12" class="comp-lbl">R2</text>
+                <line x1="260" y1="0" x2="280" y2="0" stroke="#7f8c8d" stroke-width="1.5"/><text x="288" y="4" class="node-lbl">N2N</text>
+            </g>
+
+            <!-- 通道 3 -->
+            <g transform="translate(30, 280)">
+                <text x="0" y="4" class="node-lbl">N3P</text><line x1="30" y1="0" x2="50" y2="0" stroke="#7f8c8d" stroke-width="1.5"/>
+                <use href="#ind" x="50" y="0"/><text x="58" y="-12" class="comp-lbl">LD3</text><text x="110" y="16" class="node-lbl">N3M1</text>
+                <use href="#vsrc" x="130" y="0" class="interactive" onmouseover="showGroup('v3')" onmouseout="clearAll()"/>
+                <text x="140" y="-15" class="comp-lbl">V3 (采样)</text><text x="178" y="16" class="node-lbl">N3M</text>
+                <use href="#res" x="200" y="0"/><text x="215" y="-12" class="comp-lbl">R3</text>
+                <line x1="260" y1="0" x2="280" y2="0" stroke="#7f8c8d" stroke-width="1.5"/><text x="288" y="4" class="node-lbl">N3N</text>
+            </g>
+
+            <!-- 通道 4 -->
+            <g transform="translate(30, 370)">
+                <text x="0" y="4" class="node-lbl">N4P</text><line x1="30" y1="0" x2="50" y2="0" stroke="#7f8c8d" stroke-width="1.5"/>
+                <use href="#ind" x="50" y="0"/><text x="58" y="-12" class="comp-lbl">LD4</text><text x="110" y="16" class="node-lbl">N4M1</text>
+                <use href="#vsrc" x="130" y="0" class="interactive" onmouseover="showGroup('v4')" onmouseout="clearAll()"/>
+                <text x="140" y="-15" class="comp-lbl">V4 (采样)</text><text x="178" y="16" class="node-lbl">N4M</text>
+                <use href="#res" x="200" y="0"/><text x="215" y="-12" class="comp-lbl">R4</text>
+                <line x1="260" y1="0" x2="280" y2="0" stroke="#7f8c8d" stroke-width="1.5"/><text x="288" y="4" class="node-lbl">N4N</text>
+            </g>
+
+            <!-- K3_2 互感线 -->
+            <path d="M 110,190 Q 145,235 110,280" fill="none" stroke="#e67e22" stroke-width="1.5" stroke-dasharray="4,4"/>
+            <text x="135" y="242" style="font-size:10px; fill:#e67e22; font-weight:bold;">K3_2</text>
+
+
+            <!-- ==================== 右侧：4个核心状态节点 ==================== -->
+            <!-- Node 1 -->
+            <g transform="translate(790, 100) rotate(90)">
+                <use href="#ind"/><use href="#gnd" x="52" y="0" transform="rotate(-90 52 0)"/>
+            </g>
+            <circle cx="790" cy="100" r="8" fill="#e74c3c" class="interactive" onmouseover="showGroup('n1')" onmouseout="clearAll()"/>
+            <text x="805" y="104" class="node-lbl" style="font-size:14px;">Node 1</text><text x="815" y="135" class="comp-lbl">L1</text>
+
+            <!-- Node 2 -->
+            <g transform="translate(940, 100) rotate(90)">
+                <use href="#ind"/><use href="#gnd" x="52" y="0" transform="rotate(-90 52 0)"/>
+            </g>
+            <circle cx="940" cy="100" r="8" fill="#e74c3c" class="interactive" onmouseover="showGroup('n2')" onmouseout="clearAll()"/>
+            <text x="955" y="104" class="node-lbl" style="font-size:14px;">Node 2</text><text x="965" y="135" class="comp-lbl">L2</text>
+
+            <!-- Node 3 -->
+            <g transform="translate(790, 280) rotate(90)">
+                <use href="#ind"/><use href="#gnd" x="52" y="0" transform="rotate(-90 52 0)"/>
+            </g>
+            <circle cx="790" cy="280" r="8" fill="#e74c3c" class="interactive" onmouseover="showGroup('n3')" onmouseout="clearAll()"/>
+            <text x="805" y="284" class="node-lbl" style="font-size:14px;">Node 3</text><text x="815" y="315" class="comp-lbl">L3</text>
+
+            <!-- Node 4 -->
+            <g transform="translate(940, 280) rotate(90)">
+                <use href="#ind"/><use href="#gnd" x="52" y="0" transform="rotate(-90 52 0)"/>
+            </g>
+            <circle cx="940" cy="280" r="8" fill="#e74c3c" class="interactive" onmouseover="showGroup('n4')" onmouseout="clearAll()"/>
+            <text x="955" y="284" class="node-lbl" style="font-size:14px;">Node 4</text><text x="965" y="315" class="comp-lbl">L4</text>
+            <!-- ==================== 关联虚线层 ==================== -->
+            <!-- F矩阵线 (紫色) -->
+            <g stroke="#9b59b6" fill="none">
+                <path d="M 180,100 Q 480,60 790,100" class="coupling-line v1-group"/>
+                <path d="M 180,100 Q 560,40 940,100" class="coupling-line v1-group"/>
+                <path d="M 180,100 Q 450,180 790,280" class="coupling-line v1-group"/>
+                <path d="M 180,100 Q 530,190 940,280" class="coupling-line v1-group"/>
+                
+                <path d="M 180,190 Q 480,130 790,100" class="coupling-line v2-group"/>
+
+
+<script type="text/javascript">
+        // 1. 正确获取状态栏元素
+        var statusText = document.getElementById('status-bar');
+
+        // 2. 鼠标移入显示关联线
+        function showGroup(groupName) {
+            statusText.style.opacity = "1";
+            
+            if (groupName.indexOf('v') === 0) {
+                statusText.innerText = "[CCCS 前向控制矩阵] 通道 " + groupName.toUpperCase() + " 的采样电流正在控制核心节点 Node 1 ~ 4 的注入电流";
+                statusText.style.fill = "#9b59b6";
+            } else {
+                var nodeNum = groupName.replace('n', '');
+                statusText.innerText = "[VCCS 反向反馈矩阵] 核心节点 Node " + nodeNum + " 的瞬态电压正跨导反馈至输入通道的 NxM 节点";
+                statusText.style.fill = "#e67e22";
+            }
+
+            var className = '.' + groupName + '-group';
+            var targetLines = document.querySelectorAll(className);
+            for (var i = 0; i < targetLines.length; i++) {
+                targetLines[i].classList.add('show-link');
+            }
+        }
+
+        // 3. 鼠标移出安全清除所有高亮
+        function clearAll() {
+            statusText.style.opacity = "0";
+            
+            var allLines = document.querySelectorAll('.coupling-line');
+            for (var k = 0; k < allLines.length; k++) {
+                allLines[k].classList.remove('show-link');
+            }
+        }
+    </script>
